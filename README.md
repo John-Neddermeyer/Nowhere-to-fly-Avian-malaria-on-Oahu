@@ -1,6 +1,6 @@
 # Nowhere-to-fly-Avian-malaria-on-Oahu
 This repository contains the analysis pipeline for the manuscript: 
-"Nowhere to fly: Avian malaria is ubiquitous from ocean to summit on a Hawaiian island" 10.1016/j.biocon.2023.109943.
+"Nowhere to fly: Avian malaria is ubiquitous from ocean to summit on a Hawaiian island" DOI:10.1016/j.biocon.2023.109943.
 
 The repository does not contain all exploratory analayses, but given the same version of Program R and versions of Program R packages running the code in
 this repository should reporduce the results presented in the manuscript.
