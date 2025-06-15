@@ -2,8 +2,7 @@
 This repository contains the analysis pipeline for the manuscript: 
 "Nowhere to fly: Avian malaria is ubiquitous from ocean to summit on a Hawaiian island" DOI:10.1016/j.biocon.2023.109943.
 
-The repository does not contain all exploratory analayses, but given the same version of Program R and versions of Program R packages running the code in
-this repository should reporduce the results presented in the manuscript.
+The repository does not contain all exploratory analayses, but should provide enough detail to understand analyses approach and methods. Please reach out with any questions.
 
 # Modeling Approach
 The goal of the analysis was to evaluate the relationship between avian malaria host prevalence and host identity, environmental metrics, host community 
