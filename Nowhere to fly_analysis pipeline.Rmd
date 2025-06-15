@@ -1,0 +1,1387 @@
+---
+title: 'Nowhere to fly: Avian malaria is ubiquitous from ocean to summit on a 
+Hawaiian Island_analysis pipeline'
+author: "John Neddermeyer"
+date: "2022-11-04"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+#load packages for data cleaning and joining variables
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+library(broom)
+library(broom.mixed)
+library(caret)
+library(pROC)
+library(faraway)
+library(doParallel)
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+```{r}
+#Packages for gathering and plotting spatial data
+library(MODIStsp)
+library(sf)
+library(rgdal)
+library(raster)
+library(stars)
+library(terra)
+library(readr)
+library(rasterVis)
+library(FedData)
+```
+
+#Generating data frame containing climate and site elevation data
+```{r}
+#read in malaria screening results and environmental variables
+malaria.data <- 
+  read.csv(
+    "~/Desktop/avain_malaria_prevalence/data/oahu.avian.malaria.results.csv")
+
+max_temperature <- 
+  read.csv("~/Desktop/avain_malaria_prevalence/data/tmax.csv")
+
+min_temperature <- 
+  read.csv("~/Desktop/avain_malaria_prevalence/data/tmin.csv")
+rain <- read.csv("~/Desktop/avain_malaria_prevalence/data/precipdata.csv")
+```
+
+```{r}
+#cleaning malaria screening data and preparing environmental data.frames 
+#to be joined with malaria screening results
+cols_to_be_rectified <- 
+  names(malaria.data)[vapply(malaria.data, is.character, logical(1))]
+#columns_to_be_rectified are targeted to remove trailing white spaces from 
+#levels of variable. This is passed to lapply where the function "trimws"
+#is used
+malaria.data[,cols_to_be_rectified] <- 
+  lapply(malaria.data[,cols_to_be_rectified], trimws,c("both"))
+#renaming variables and recalssifying to enable analysis
+
+max_temperature <- max_temperature %>%
+  rename(Month=month, Year=year,Site=SiteID) %>% 
+  select(Month, Site, tmax, Year) %>% group_by(Site,Year, Month) %>% 
+  summarise(tmax=mean(tmax))%>% subset(!Year %in% c(2014))
+max_temperature$Site<-toupper(max_temperature$Site)
+
+min_temperature <- min_temperature %>%
+  rename(Month=variable, Site=SiteID, tmin=value, Year=year)%>% 
+  subset(!Year %in% c(2014))
+min_temperature$Site<-toupper(min_temperature$Site)
+
+rain <- rain %>%
+  rename(Month=month, Site=SiteID, Year=year) %>% 
+  select(Month, Site, Year, precip) %>% group_by(Site,Year, Month) %>%
+  summarise(precip=mean(precip)) %>% subset(!Year %in% c(2014))
+rain$Site<-toupper(rain$Site)
+```
+
+```{r}
+#join environmental variables and elevation to malaria screening data
+site_elevation_key<-data.frame(Site=c("EKA","KAH","MOA","MTK","PAH","TAN",
+                                      "WAI"),
+                            elevation=c(410,670,105,1209,655,547,249))
+malaria.data<-left_join(malaria.data,
+                        min_temperature,by=c("Site","Year","Month")) %>%
+  left_join(.,max_temperature,by=c("Site","Year","Month")) %>%
+  left_join(.,rain,by=c("Site","Year","Month")) %>%
+  left_join(.,site_elevation_key,by="Site")
+
+malaria.data <- malaria.data %>%
+  rename("result"=X11GRW4_qPCR) %>%
+  mutate(Ct=as.numeric(ifelse(Ct=="und",0,Ct)),
+         result_0_1=factor(if_else(result=="negative", 0, 1)),
+         SampleDate = mdy(SampleDate),
+         day_of_year = yday(SampleDate),
+         Year = factor(Year),
+         Month = factor(Month),
+         mean_temp=(tmax+tmin)/2) %>% 
+  mutate_if(is.character, as.factor)
+
+```
+
+#Evaluate how best to generate community diversity metrics by either lumping 
+all species sampled at a site across all years or separating out species 
+sampled at a site in a given year. Generate rarefaction curves for each way of 
+looking at species diversity over the course of the study. If the curves start 
+to plateau we are likely to have an adequate sampling of species.
+```{r}
+#first generate a dataframe the has the number of samples per species per site
+#the format is a wide dataframe with each species as columns. If a site doesn't
+#have that species a 0 is put in for that species at that site.
+diversity_matrix<-malaria.data %>% group_by(Site, Species) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Species, 
+              values_from = Samples, values_fill = c(Samples=0))
+#storing the data.frame as a different object for rarefaction curve
+d<-data.frame(diversity_matrix,row.names = TRUE)
+#Using rarecurve function on the data frame containing the species counts by
+#site "d" from the code chunk above we generate an object "obj" that contains
+#the resulting rarefaction curves as a list. When evaluating species diversity
+#at each site across years the object has 7 lists 1 for each site
+obj<-vegan::rarecurve(d, step = 1,cex = 0.25,label = F)
+#naming each list by the names of each row in frame d which corresponds to our
+#sites
+names(obj) = rownames(d)
+#The code for pulling the vegan object into a ggplot object was modified from
+#this web address:
+#https://ucdavis-bioinformatics-training.github.io/2021-May-Microbial-Community-Analysis/data_analysis/mca_part2
+# Coerce data into "long" form.
+rare_curve <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$Site <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = obj, y = as.list(names(obj)), SIMPLIFY = FALSE)
+xy <- do.call(rbind, rare_curve)
+rownames(xy) <- NULL
+# Plot Rarefaction curve as ggplot object
+ggplot(xy,aes(x = subsample, y = value)) +
+  theme_bw() + geom_line() + facet_wrap(~Site) +
+  geom_vline(xintercept=min(rowSums(d)), color= "red", linetype='dashed') + 
+  labs(title="Sampled Site Rarefaction curves") + xlab("Samples") + 
+  ylab('Species')
+
+```
+
+
+```{r}
+#all code is similar to chunk above but here we're grouping by year and site
+#so we'll have to generate a column with a unique identifier for each 
+#site/year combination
+diversity_matrix_year_site<-malaria.data %>% group_by(Year,Site,Species) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Species, 
+              values_from = Samples, values_fill = c(Samples=0)) %>%
+  mutate(Site_year=paste(Site,Year,sep = "_")) %>% 
+  ungroup() %>% select(-Year,-Site) %>% relocate(Site_year)
+d<-data.frame(diversity_matrix_year_site,row.names = TRUE)
+
+obj<-vegan::rarecurve(d, step = 1,cex = 0.25,label = F)
+names(obj) = rownames(d)
+
+# Coerce data into "long" form.
+rare_curve <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$Site <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = obj, y = as.list(names(obj)), SIMPLIFY = FALSE)
+
+xy <- do.call(rbind, rare_curve)
+rownames(xy) <- NULL
+# Plot Rarefaction curve
+xy%>% mutate(Year=word(xy$Site,2,sep="_"), Site2=word(xy$Site,1,sep = "_")) %>%
+ggplot(aes(x = subsample, y = value)) +
+  theme_bw() + geom_line() + facet_grid(Year~Site2) +
+  geom_vline(xintercept=min(rowSums(d)), color= "red", linetype='dashed') + 
+  labs(title="Sampled Site by Year Rarefaction curves") + xlab("Samples") + 
+  ylab('Species')
+
+```
+
+#Based on curves it looks like we observe more plateaus in species number when
+species counts are lumped across all years so we'll have 1 value for community
+composition metric for each site. A total of 7 values per composition metric
+```{r}
+#generate shannon's h index, simpson's diversity index, rarefied species number
+#and species richness per site to use for modeling
+diversity_matrix<-malaria.data %>% group_by(Site, Species) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Species, 
+              values_from = Samples, values_fill = c(Samples=0))
+diversity_matrix<-
+  cbind(diversity_matrix,
+        data.frame(Shannon_H_index=vegan::diversity(diversity_matrix[,-1],
+                                                    "shannon"),
+                   simp=vegan::diversity(diversity_matrix[,-1],"simpson"),
+                   rare=vegan::rarefy(diversity_matrix[,-1],
+                                      min(rowSums(diversity_matrix[,-1]))),
+                   spec_num=vegan::specnumber(diversity_matrix[,-1])))
+
+
+malaria.data<-left_join(malaria.data,diversity_matrix %>% 
+                        select(Shannon_H_index,simp,rare,spec_num),
+                        by=c("Site"))
+```
+
+#Pulling in the spatial data. NDVI both at 250m and 1km scales, and 
+national land cover data.
+```{r}
+#using function from MODIStsp package to download data from MODIS 
+#database
+#setting gui to false prevents function from launching web browser to
+#download data. Then we set the directory to send downloads to. Then we set
+#the product we want to download "selprod". Function MODIStsp_get_prodnames()
+#will list the products available. 
+#Function MODIStsp_get_prodlayers("insert product name") will return available
+#bandsel information. Set start and end data for data and user name and
+#password for database. Spatmeth is telling the function you will provide a
+#path to the shapefile that contains the area you want the information for
+#spafile, and set output format.
+#extracting NDVI at 1km resolution
+MODIStsp(
+  gui = FALSE,
+  out_folder = "VegetationData",
+  out_folder_mod = "VegetationData",
+  selprod = "Vegetation_Indexes_Monthly_1Km (M*D13A3)",
+  bandsel = "NDVI",
+  user = "insert user name",
+  password = "insert password",
+  start_date = "2017.01.01",
+  end_date = "2017.12.31",
+  verbose = TRUE,
+  spatmeth = "file",
+  spafile = '/path/to/shapefile.shp',
+  out_format = "GTiff"
+)
+
+```
+
+```{r}
+#Same as above but changing the data product from NDVI at 1km to 250m
+MODIStsp(
+  gui = FALSE,
+  out_folder = "VegetationData",
+  out_folder_mod = "VegetationData",
+  selprod = "Vegetation Indexes_16Days_250m (M*D13Q1)",
+  bandsel = "NDVI",
+  user = "insert user name",
+  password = "insert password",
+  start_date = "2017.01.01",
+  end_date = "2017.12.31",
+  verbose = TRUE,
+  spatmeth = "file",
+  spafile = '/path/to/shapefile.shp',
+  out_format = "GTiff"
+)
+```
+
+#Note I'm only showing how I extracted this information for 1 year, but 
+this process was repeated 3 times once for each year 2015, 2016, 2017. 
+Where the date of file names changes each time.
+
+```{r}
+#bring in sample site shape file for extracting raster values.
+vine_shapefile<-st_read("~/path/to/shapefile")
+#generate list of .tif files in the directory. The directory contains 1 .tiff
+#file per month at 1km resolution for year x
+#Change date here
+list_tff_files_1km <- 
+  list.files("~/Desktop/avain_malaria_prevalence/VegetationData/honolulu_county/VI_Monthly_1Km_v6/NDVI_2017", 
+             "tif$", full.names=TRUE)
+#stack those .tif files into 1 single raster file for extracting raster values
+#that overlap with sample sites
+raster_stack_1km<-raster::stack(list_tff_files_1km)
+#write the combined raster to a .tif file
+#Change date here
+writeRaster(raster_stack_1km, filename = "~/Desktop/avain_malaria_prevalence/VegetationData/NDVI_1km_2017_merged.tif")
+```
+
+
+```{r}
+#for loop going through each generated combined raster file from above and
+#extracting NDVI data for each site.
+master_1km_frame<-NULL
+years<-c("2015","2016","2017")
+for(year in years){
+#when using sprintf the %s location is replaced with the variable year
+file_path <-sprintf("~/Desktop/avain_malaria_prevalence/VegetationData/NDVI_1km_%s_merged.tif", year)
+#read the combined raster into r
+raster_1km<-read_stars(file_path)
+#make sure sites shape file and ndvi raster are in the same
+#coordinate reference system
+vine_shapefile_converted<-st_transform(vine_shapefile,st_crs(raster_1km))
+#extract raster values that overlap with. mean is the function we call to
+#determine how we want to extract our value. If multiple pixels overlap with
+#the region we want to extract info for mean would take the average value for
+#all pixels. I think we're saying as points false because we are extracting
+#values from a raster but I'm not sure.
+site_classification <- aggregate(raster_1km, vine_shapefile_converted, mean,
+                                 as_points = FALSE)
+#Here we are looking into the object "site_classification" and extracting a
+#matrix of values that correspond to our site ndvi. Each row corresponds to a 
+#site and the columns are ndvi values for that month. 
+#change year here
+mat_1km<-site_classification[[1]]
+#building a dataframe of these yearly NDVI to join with analysis dataframe
+frame_1km <- data.frame(mat_1km)
+colnames(frame_1km)<-c(seq(1:12))
+frame_1km<-frame_1km %>% 
+  mutate(Site=c("EKA","KAH","MOA","MTK","PAH","TAN","WAI")) %>% 
+  pivot_longer(!Site,names_to = "Month",values_to ="NDVI" ) 
+
+frame_1km$Year <-rep(year,times=84)
+#build master frame
+#when you first build master frame object make sure you remove it from the
+#rbind function. So for the first iteration you'll just store the "frame_1km"
+#object in "master_1km_frame" for the remaining iterations it will be rbind(
+#master_1km_frame,frame_1km) to get a data.frame with NDVI for each month for
+#each site.
+
+ifelse(is.null(master_1km_frame),
+       master_1km_frame <- frame_1km,
+       master_1km_frame<-rbind(master_1km_frame,frame_1km))
+}
+
+```
+
+#We're following the same steps as above here but for 250m resolution rather
+than 1km
+```{r}
+#generate 250m resolution
+list_tff_files_250m <- 
+  list.files("~/Desktop/avain_malaria_prevalence/VegetationData/honolulu_county/VI_16Days_250m_v6/NDVI_2017", 
+             "tif$", full.names=TRUE)
+raster_stack_250m<-raster::stack(list_tff_files_250m)
+#change year here
+writeRaster(raster_stack_250m, filename = "~/Desktop/avain_malaria_prevalence/VegetationData/NDVI_250m_2017_merged.tif")
+```
+
+```{r}
+master_250m_frame<-NULL
+years<-c("2015","2016","2017")
+for(year in years){
+#when using sprintf the %s location is replaced with the variable year
+file_path <-sprintf("~/Desktop/avain_malaria_prevalence/VegetationData/NDVI_250m_%s_merged.tif", year)
+
+raster_250m<-read_stars(file_path)
+vine_shapefile_converted<-st_transform(vine_shapefile,st_crs(raster_250m))
+site_classification <- aggregate(raster_250m, vine_shapefile_converted, 
+                                 mean,as_points = FALSE)
+
+mat_250m<-site_classification[[1]]
+frame_250m<-data.frame(mat_250m)
+#The 250m resolution data are shared on a 16 day interval. I needed to add the
+#column names to be able to roughly average by month for the purposes of
+#analysis. 2 values for each month except December
+colnames(frame_250m)<-c("1_1","1_2","2_1","2_2","3_1","3_2","4_1","4_2",
+"5_1","5_2","6_1","6_2","7_1","7_2","8_1","8_2","9_1","9_2","10_1","10_2",
+                        "11_1","11_2","12_1")
+frame_250m<-frame_250m %>% 
+  mutate(Site=c("EKA","KAH","MOA","MTK","PAH","TAN","WAI")) %>% 
+  pivot_longer(!Site,names_to = "month",values_to ="NDVI" ) %>% 
+  mutate(Month=word(month,1,sep = "_"),grp=word(month,2,sep = "_")) %>% 
+  group_by(Site, Month) %>% summarise(NDVI=mean(NDVI,na.rm=TRUE))
+#change year here
+frame_250m$Year <-rep(year,times=84)
+
+ifelse(is.null(master_250m_frame),
+       master_250m_frame <- frame_250m,
+       master_250m_frame<-rbind(master_250m_frame,frame_250m))
+
+}
+```
+
+
+```{r}
+#Function for converting raster file from National Land Cover Database to a
+#Dataframe. Function came from:
+#https://bookdown.org/mcwimberly/gdswr-book/raster-data-discrete-variables.html
+rasterdf<-function(x, aggregate = 1) {
+   resampleFactor <- aggregate        
+   inputRaster <- x    
+   inCols <- ncol(inputRaster)
+   inRows <- nrow(inputRaster)
+   # Compute numbers of columns and rows in the new raster for mapping
+   resampledRaster <- raster(ncol=(inCols / resampleFactor), 
+                             nrow=(inRows / resampleFactor))
+   # Match to the extent of the original raster
+   extent(resampledRaster) <- extent(inputRaster)
+   # Resample data on the new raster
+   y <- resample(inputRaster,resampledRaster,method='ngb')
+   # Extract cell coordinates  
+   coords <- xyFromCell(y, seq_len(ncell(y)))
+   dat <- stack(as.data.frame(getValues(y)))
+   # Add names - 'value' for data, 'variable' to indicate different raster layers
+   # in a stack
+   names(dat) <- c('value', 'variable')
+   dat <- cbind(coords, dat)
+   dat
+}
+```
+
+```{r}
+#Raster data for Oahu downloaded from National Land Cover Database using 
+#viewer tool https://www.mrlc.gov/viewer/ year 2016.
+#Read in raster data from NLCD
+nlcd16 <- raster("~/Downloads/NLCD_MEhsMCuVQJgeVOmLbQpg/NLCD_2001_Land_Cover_HI_20080930_MEhsMCuVQJgeVOmLbQpg.tiff")
+#call rasterdf function on raster object from NLCD
+nlcd16_df<-rasterdf(nlcd16)
+#Remove 0 values from data frame. The raster file contained pixels that did
+#not have a classification according to NLCD categories because the extent
+#around Oahu I downloaded was wider than just the island and contained ocean.
+nlcd16_df<-nlcd16_df %>% filter(value!=0)
+#FedData package has access to the color pallet for the NLCD to keep colors in
+#map that correspond to NLCD I need the color pallet associated with each
+#classification. pal_nlcd() also has the category descriptions for NLCD.
+legend<-pal_nlcd()
+#Generate list of the NLCD classifications found on Oahu.
+categories_in_study_area<-unique(nlcd16_df$value)
+#Filter legend object to only include those found on Oahu. The ID column in 
+#legend contains the values associated with the NLCD categories.
+filtered_land_cover<-legend[legend$ID %in% categories_in_study_area,]
+#Convert vine_shapefile CRS to nlcd16 CRS
+vine_shapefile_nlcd16<-st_transform(vine_shapefile,st_crs(nlcd16))
+#reclassify all disturbed categories in NLCD into 1 "Developed" category
+#For the map I left cultivated crops separate but in the analysis for the
+#proportion developed category cultivated crops were included with developed
+#Generate a list of old category numbers
+old_LCcodes <- c(11, 21, 22, 23, 24, 31, 42, 52, 71, 82, 90, 95)
+#Generate a list of the new categories. Notice how the 20 series above is
+#replaced with 2s in the new list. Also the length of the old and new codes
+#must match
+new_LCcodes <- c(1, 2, 2, 2, 2, 3, 4, 5, 6, 7, 8, 9)
+#Build a lookup table for old and new codes
+lookup <- data.frame(old_LCcodes, new_LCcodes)
+#Call subs function to reclassify the nlcd16 raster file with new codes.
+nlcd16_rc <- subs(nlcd16, lookup)
+#Match new names with new colors for Supplemental Figure 3
+newnames <- c("Water",
+  "Developed",
+  "Barren",
+  "EvergreenForest",
+  "ShrubScrub",
+  "GrassHerbaceous",
+  "CultCrops",
+  "WoodyWetlands",
+  "EmergentHerbWet")
+newcols <- c("mediumblue", 
+             "red2", 
+             "gray60", 
+             "darkgreen", 
+             "yellow2", 
+             "orange4", 
+             "paleturquoise2",
+             "#CC79A7",
+             "#64B3D5")
+#call rasterdf function on reclassified raster and drop NA under "value" column
+#NA values generated because the original raster nlcd16 has 0 values that we
+#did not reclassify in nlcd16_rc and so they are replaced with NA.
+nlcd16_rc_df <- rasterdf(nlcd16_rc) %>% drop_na()
+```
+
+```{r}
+#Generate map of land classification before re-coding land classification
+ggplot(data = nlcd16_df) +
+  geom_raster(aes(x = x, y = y, fill = as.character(value))) + 
+  scale_fill_manual(name = "Land cover",
+                    values = filtered_land_cover$Color,
+                    labels = filtered_land_cover$Class,
+                    na.translate = FALSE) +
+  coord_sf(expand = F) + geom_sf(data = vine_shapefile_nlcd16,color="black") + 
+  geom_sf_text(data =vine_shapefile_nlcd16,aes(label=Name),size=2,
+               fontface="bold",color="black",
+               position=position_jitter(width=0,height=0.01)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.background = element_rect(fill = "white", color = "black"))
+```
+
+#Supplemental Figure 3 map of land classifications used in analysis
+```{r}
+ggplot(data = nlcd16_rc_df ) +
+  geom_raster(aes(x = x, y = y, fill = as.character(value))) + 
+  scale_fill_manual(name = "Land cover",
+                    values = newcols,
+                    labels = newnames,
+                    na.translate = FALSE) +
+  coord_sf(expand = F) + geom_sf(data = vine_shapefile_nlcd16,color="black") + 
+  geom_sf_text(data = vine_shapefile_nlcd16,aes(label=Name),size=2,
+               fontface="bold",color="black",
+               position=position_jitter(width=0, height=0.01)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.background = element_rect(fill = "white", color = "black"))
+```
+
+```{r}
+#Generate proportion of cells around sampling sites that are classified as
+#human altered. Cells that are classified as disturbed or cultivated crop are
+#considered.
+#Make sure sites shapefile is in the same CRS as the reclassified NLCD raster
+vine_shapefile_nlcd16_rc<-st_transform(vine_shapefile,st_crs(nlcd16_rc))
+#Extract values for cells that are within 200m, 500m, 1000m radii. If df=FALSE,
+#the output is a list object with 1 list for each site. Note the units for
+#buffer is determined by units of raster file.
+extract_radius_250m<-raster::extract(nlcd16_rc, vine_shapefile_nlcd16_rc, 
+                                     buffer = 250,df=TRUE)
+extract_radius_500m<-raster::extract(nlcd16_rc, vine_shapefile_nlcd16_rc, 
+                                     buffer = 500,df=TRUE)
+extract_radius_1000m<-raster::extract(nlcd16_rc, vine_shapefile_nlcd16_rc, 
+                                      buffer = 1000,df=TRUE)
+#Generate proportions for disturbed land cover at 250m
+land_cover_impact_250m<-data.frame(extract_radius_250m) %>% 
+  mutate(new_LCcodes=factor(new_LCcodes)) %>% group_by(ID) %>% 
+  summarise(sam=n(),human_inf=sum(`new_LCcodes`=="2"|`new_LCcodes`=="7"), 
+            prop_impacted_250m=human_inf/sam) %>% 
+  mutate(Site=factor(c("EKA","KAH","MOA","MTK","PAH","TAN","WAI"))) %>% 
+  select(prop_impacted_250m,Site)
+#500m
+land_cover_impact_500m<-data.frame(extract_radius_500m) %>% 
+  mutate(new_LCcodes=factor(new_LCcodes)) %>% group_by(ID) %>% 
+  summarise(sam=n(),human_inf=sum(`new_LCcodes`=="2"|`new_LCcodes`=="7"), 
+            prop_impacted_500m=human_inf/sam) %>% 
+  mutate(Site=factor(c("EKA","KAH","MOA","MTK","PAH","TAN","WAI"))) %>% 
+  select(prop_impacted_500m,Site)
+#1000m
+land_cover_impact_1000m<-data.frame(extract_radius_1000m) %>% 
+  mutate(new_LCcodes=factor(new_LCcodes)) %>% group_by(ID) %>% 
+  summarise(sam=n(),human_inf=sum(`new_LCcodes`=="2"|`new_LCcodes`=="7"), 
+            prop_impacted_1000m=human_inf/sam) %>% 
+  mutate(Site=factor(c("EKA","KAH","MOA","MTK","PAH","TAN","WAI"))) %>% 
+  select(prop_impacted_1000m,Site)
+
+```
+
+```{r}
+#Join NDVI data into malaria dataframe
+#bring in NDVI per month at 1km
+malaria.data<-left_join(malaria.data,master_1km_frame %>% 
+                          rename("NDVI_km"="NDVI") %>%
+                          mutate(Site=factor(Site),
+                                 Month=factor(Month),Year=factor(Year)),
+                        by=c("Site","Month","Year"))
+#bring in NDVI per month at 250m
+malaria.data<-left_join(malaria.data,master_250m_frame %>% 
+                          rename("NDVI_m"="NDVI") %>% 
+                          mutate(Site=factor(Site),
+                                 Month=factor(Month),Year=factor(Year)),
+                        by=c("Site","Month","Year"))
+#calculating mean annual site NDVI per year and overall mean site NDVI across
+#all years at 250m and 1km.
+malaria.data<-left_join(malaria.data, malaria.data %>% 
+            group_by(Year,Site) %>% 
+            summarise(NDVI_mean_annual_per_year_km=mean(NDVI_km)),
+          by=c("Year","Site")) %>% 
+  left_join(.,malaria.data %>% group_by(Site) %>% 
+              summarise(NDVI_mean_annual_across_years_km=mean(NDVI_km)),
+            by=c("Site")) %>%
+  left_join(.,malaria.data %>% group_by(Year,Site) %>% 
+              summarise(NDVI_mean_annual_per_year_m=mean(NDVI_m)),
+             by=c("Year","Site")) %>%
+  left_join(.,malaria.data %>% group_by(Site) %>% 
+              summarise(NDVI_mean_annual_across_years_m=mean(NDVI_m)),
+            by=c("Site"))
+#Join proportion human land use into malaria dataframe
+malaria.data<-left_join(malaria.data,land_cover_impact_250m,by=c("Site")) %>%
+  left_join(.,land_cover_impact_500m,by=c("Site")) %>%
+  left_join(.,land_cover_impact_1000m,by=c("Site"))
+#Subset data to include only samples that could be aged as either adult or 
+#juvenile, and reduce species to the 3 most sampled species RBLE, WAWE, 
+#and RWBU. This will be the data set used for modeling
+subsetted<-malaria.data %>%
+  subset(Species %in% c("JAWE","RBLE","RWBU")) %>%
+  subset(Age %in% c("a","j")) %>% 
+  mutate(Species=recode(Species,JAWE="WAWE"))
+#Change factor levels to make reference species RBLE and reference year 2016
+#This is important for visulaizing results later on
+subsetted$Species=relevel(subsetted$Species,ref="RBLE")
+subsetted$Year=relevel(subsetted$Year,ref="2016")
+```
+
+```{r}
+predictors_for_correlation_testing <-subsetted %>% 
+  select(tmax,precip,Shannon_H_index,simp,rare,spec_num)
+correlations <- polycor::hetcor(predictors_for_correlation_testing,
+                                use="pairwise.complete.obs")
+correlations$correlations
+```
+
+
+#Summary tables. All species by site across years, and modeled species by age,
+site, and year
+```{r}
+malaria.data %>% group_by(Site, Species) %>% 
+  summarise(Samples=n(),Positive=sum(`result_0_1`==1),
+            prev=round(Positive/Samples,digits=3)) %>% knitr::kable()
+subsetted %>% group_by(Year, Site, Species, Age) %>% 
+  summarise(Samples=n(),Positive=sum(`result_0_1`==1),
+            prev=round(Positive/Samples,digits=3)) %>% knitr::kable()
+```
+
+#evaluating patterns of non-linearity for predictors day_of_year, tmax, tmin,
+elevation, precipitation, NDVI
+```{r}
+m<-mgcv::gam(result~s(day_of_year,by=Species)+s(day_of_year,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(tmax,by=Species)+s(tmax,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(tmin,by=Species)+s(tmin,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(precip,by=Species)+s(precip,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(NDVI_m,by=Species)+s(NDVI_m,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(NDVI_km,by=Species)+s(NDVI_km,by=Year)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+
+m<-mgcv::gam(result~s(elevation,by=Species,k=4)+s(elevation,by=Year,k=4)+Species
+             +Year,data = subsetted, family = binomial)
+plot(m)
+summary(m)
+```
+
+#AIC comparisions between tmax, tmin, elevation and mean temperature, and
+identify important interaction terms
+```{r}
+m <- glm(result_0_1~tmax*Year+tmax*Species+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m2 <- glm(result_0_1~tmin*Year+tmin*Species+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m3 <- glm(result_0_1~elevation*Year+elevation*Species+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m4 <- glm(result_0_1~mean_temp*Year+mean_temp*Species+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m5 <- glm(result_0_1~tmax*Year+tmax*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m6 <- glm(result_0_1~tmax*Year+tmax*Species+Year*Species+Age+
+           Year*precip, data=subsetted, family = binomial)
+m7 <- glm(result_0_1~tmax*Year+tmax*Species+Year*Species+Age*Species, 
+          data=subsetted, family = binomial)
+m8 <- glm(result_0_1~tmax*Species+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m9 <- glm(result_0_1~tmax*Year+Year*Species+Age*Species+
+           Year*precip, data=subsetted, family = binomial)
+m10 <- glm(result_0_1~tmax*Year+tmax*Species+precip+Age, 
+           data=subsetted, family = binomial)
+#include species richness predictor and compare interaction terms after
+#identifying top model without species richness
+m11 <- glm(result_0_1~tmax*Year+tmax*Species+spec_num*Species+spec_num*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m12 <- glm(result_0_1~tmax*Year+tmax*Species+spec_num*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m13 <- glm(result_0_1~tmax*Year+tmax*Species+spec_num*Species+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m14 <- glm(result_0_1~tmax*Year+tmax*Species+spec_num+
+             precip+Age, 
+           data=subsetted, family = binomial)
+#swapping out species richness with shannon's H
+m15 <- glm(result_0_1~tmax*Year+tmax*Species+Shannon_H_index*Species+
+             Shannon_H_index*Year+precip+Age, 
+           data=subsetted, family = binomial)
+m16 <- glm(result_0_1~tmax*Year+tmax*Species+Shannon_H_index*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m17 <- glm(result_0_1~tmax*Year+tmax*Species+Shannon_H_index*Species+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m18 <- glm(result_0_1~tmax*Year+tmax*Species+Shannon_H_index+
+             precip+Age, 
+           data=subsetted, family = binomial)
+#swapping out species richness with simpson's diversity
+m19 <- glm(result_0_1~tmax*Year+tmax*Species+simp*Species+simp*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m20 <- glm(result_0_1~tmax*Year+tmax*Species+simp*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m21 <- glm(result_0_1~tmax*Year+tmax*Species+simp*Species+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m22 <- glm(result_0_1~tmax*Year+tmax*Species+simp+
+             precip+Age, 
+           data=subsetted, family = binomial)
+#swapping out species richness with rarefied species richness
+m23 <- glm(result_0_1~tmax*Year+tmax*Species+rare*Species+rare*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m24 <- glm(result_0_1~tmax*Year+tmax*Species+rare*Year+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m25 <- glm(result_0_1~tmax*Year+tmax*Species+rare*Species+
+             precip+Age, 
+           data=subsetted, family = binomial)
+m26 <- glm(result_0_1~tmax*Year+tmax*Species+rare+
+             precip+Age, 
+           data=subsetted, family = binomial)
+#call fix_data_frame on the object generated from the AIC(m...m26) command
+AIC_df =fix_data_frame(AIC(m,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15,
+                           m16,m17,m18,m19,m20,m21,m22,m23,m24,m25,m26))
+
+sorted_AIC_table = AIC_df %>% arrange(AIC) %>%
+  mutate(delta_AIC = AIC - min(AIC)) %>%
+  rename(model = term)
+sorted_AIC_table
+
+```
+
+```{r}
+#top model includes interaction between tmax*Species, tmax*Year,
+#species richness * Year and precip and age. Though precip and age were not
+#found to be significant we know birds are not born with malaria and so age
+#varies even though we did not detect it, and we know without rain there can
+#be no mosquito breeding habitat at our sites. So it is retatined even though
+#it wasn't significant.
+
+top_model <- glm(result_0_1~tmax*Year+tmax*Species+spec_num*Year+
+             precip+Age, data=subsetted, family = binomial)
+summary(top_model)
+```
+
+#Plotting figure 2 from the manuscript. Done holding the effect of species
+richness constant at the mean species richness for all sites by year 
+(mean by year is important because of the significant interaction spec_num*Year)
+
+```{r}
+data<-malaria.data %>% subset(Species %in% c("RBLE","JAWE","RWBU") & 
+                                Age %in% c("a","j")) %>% 
+  mutate(Species=recode(Species, JAWE="WAWE"))
+m<-glm(result_0_1~Year*tmax+Species*tmax+precip+Age+Year*spec_num,data=data,
+       family=binomial)
+#Build new data frame for predictions
+temperatures<-seq(min(data$tmax),max(data$tmax), by=0.5)
+d.f.1<-data.frame(tmax=rep(temperatures,times=3), 
+                  Species=c(rep("RBLE",times=length(temperatures)),
+                            rep("WAWE",times=length(temperatures)),
+                            rep("RWBU",times=length(temperatures))), 
+                  Year=c(rep("2015",times=length(temperatures*3))))
+d.f.2<-data.frame(tmax=rep(temperatures,times=3), 
+                  Species=c(rep("RBLE",times=length(temperatures)),
+                            rep("WAWE",times=length(temperatures)),
+                            rep("RWBU",times=length(temperatures))), 
+                  Year=c(rep("2016",times=length(temperatures*3))))
+d.f.3<-data.frame(tmax=rep(temperatures,times=3), 
+                  Species=c(rep("RBLE",times=length(temperatures)),
+                            rep("WAWE",times=length(temperatures)),
+                            rep("RWBU",times=length(temperatures))), 
+                  Year=c(rep("2017",times=length(temperatures*3))))
+new.df<-rbind(d.f.1,d.f.2,d.f.3) %>% 
+  mutate(precip=rep(mean(data$precip),times=length(171)), 
+         Age=rep("a",times=length(171))) %>% mutate_if(is.character, as.factor)
+#within the join statement below I'm generating the mean value grouped by year
+#then joining it to the new.df by variable year
+new.df <-left_join(new.df,data %>% group_by(Year) %>% 
+  summarise(spec_num=mean(spec_num)),by="Year")
+#predict values based on new data and model coefs
+yhat <- predict(m, newdata=new.df, se.fit=TRUE)
+#generate standard error of predictions
+yhat <- data.frame( fit=yhat$fit, se.fit = yhat$se.fit)
+#bind predictions and error estimates to new data frame
+new.df <- cbind(new.df, yhat)
+#Generate lines with confidence intervals for figure
+new.df <- new.df %>% mutate(
+  phat  = faraway::ilogit(fit),
+  lwr   = faraway::ilogit( fit - 1.96 * se.fit ),
+  upr   = faraway::ilogit( fit + 1.96 * se.fit ))
+#generate estimated prevalence for each species by year for plot. Here I'm
+#generating the per year max temperature mean and per year mean species
+#richness because of interaction terms in model(year*tmax). Setting the 
+#continuous variable
+#to the mean allows estimation of the yearly prevalence per species at the
+#years average max temperature and the years average species richness
+mean_frame<-data %>% group_by(Year) %>% summarise(tmax=mean(tmax))
+mean_frame<-left_join(mean_frame,data %>% group_by(Year) %>% 
+                        summarise(spec_num=mean(spec_num)),by="Year")
+ndf<-data.frame(Year=as.factor(rep(c(2015,2016,2017),3)),
+                Species=as.factor(rep(c("WAWE","RBLE","RWBU"),each=3)),
+                precip=mean(data$precip),Age="a") 
+ndf<-left_join(ndf,mean_frame, by="Year")
+
+yhat <- predict(m, newdata=ndf, se.fit=TRUE,type = 'response')
+#generate standard error of predictions
+yhat <- data.frame( fit=yhat$fit, se.fit = yhat$se.fit)
+#bind predictions and error estimates to new data frame
+ndf <- cbind(ndf, yhat)
+ndf <- ndf %>% mutate(
+  lwr   = fit - 1.96 * se.fit,
+  upr   = fit + 1.96 * se.fit )
+#get prevalence for each temperature point
+points<-data %>% 
+  group_by(Year, Species, tmax) %>% 
+  summarise(Samples=n(),Positive=sum(`result_0_1`==1),prev=Positive/Samples)
+#filter predictions to only significant tmax slopes
+rble<-new.df %>% filter(Year=="2016"|Year=="2017") %>% filter(Species=="RBLE")
+wawe<-new.df %>% filter(Year=="2015") %>% filter(Species=="WAWE")
+frame<-rbind(rble,wawe)
+#Finally plot
+ggplot(new.df, aes(x=tmax)) + 
+  geom_point(data=points,aes(x=tmax,y=prev,size=Samples), alpha=0.65)+
+  geom_line(data=frame, aes(y=phat)) +
+  geom_abline(data = ndf,aes(intercept=fit,slope=0),linetype="dashed")+
+  geom_abline(data = ndf,aes(intercept=lwr,slope=0),linetype="dotted")+
+  geom_abline(data = ndf,aes(intercept=upr,slope=0),linetype="dotted")+
+  geom_ribbon(data=frame, aes(ymin=lwr, ymax=upr), alpha=.3) +
+   facet_grid(Species~Year,scales = "free_y")+coord_cartesian(xlim=c(20,30)) + 
+  ylab("Avian Malaria Prevalence") + 
+  xlab("Monthly Mean Maximum Temperature (°C)")+theme_bw() +
+  theme(axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7),
+        axis.title.x = element_text(size = 10),
+        axis.title.y = element_text(size = 10)) + labs(size="Sample size")
+
+```
+
+#Plotting figure 3 from the manuscript. Done holding the effect of max 
+temperature constant at the mean max temperature by year 
+(mean by year is important because of the significant interaction tmax*Year)
+```{r}
+data<-malaria.data %>% subset(Species %in% c("RBLE","JAWE","RWBU") & 
+                                Age %in% c("a","j")) %>% 
+  mutate(Species=recode(Species, JAWE="WAWE"))
+m<-glm(result_0_1~tmax*Year+tmax*Species+spec_num*Year,data = data, 
+       family = binomial)
+#Build new data frame for predictions
+spec_num_seq<-seq(min(data$spec_num),max(data$spec_num), by=0.5)
+d.f.1<-data.frame(spec_num=rep(spec_num_seq,times=3), 
+                  Species=c(rep("RBLE",times=length(spec_num_seq)),
+                            rep("WAWE",times=length(spec_num_seq)),
+                            rep("RWBU",times=length(spec_num_seq))), 
+                  Year=c(rep("2015",times=length(spec_num_seq*3))))
+d.f.2<-data.frame(spec_num=rep(spec_num_seq,times=3), 
+                  Species=c(rep("RBLE",times=length(spec_num_seq)),
+                            rep("WAWE",times=length(spec_num_seq)),
+                            rep("RWBU",times=length(spec_num_seq))), 
+                  Year=c(rep("2016",times=length(spec_num_seq*3))))
+d.f.3<-data.frame(spec_num=rep(spec_num_seq,times=3), 
+                  Species=c(rep("RBLE",times=length(spec_num_seq)),
+                            rep("WAWE",times=length(spec_num_seq)),
+                            rep("RWBU",times=length(spec_num_seq))), 
+                  Year=c(rep("2017",times=length(spec_num_seq*3))))
+new.df<-rbind(d.f.1,d.f.2,d.f.3) %>% 
+  mutate(precip=rep(mean(data$precip),times=length(81)), 
+         Age=rep("a",times=length(81))) %>% mutate_if(is.character, as.factor)
+#calculate per year mean max temp
+new.df <-left_join(new.df,data %>% group_by(Year) %>% 
+                     summarise(tmax=mean(tmax)),by="Year")
+#predict values based on new data and model coefs
+yhat <- predict(m, newdata=new.df, se.fit=TRUE)
+#generate standard error of predictions
+yhat <- data.frame( fit=yhat$fit, se.fit = yhat$se.fit)
+#bind predictions and error estimates to new data frame
+new.df <- cbind(new.df, yhat)
+#Generate lines with confidence intervals for figure
+new.df <- new.df %>% mutate(
+  phat  = faraway::ilogit(fit),
+  lwr   = faraway::ilogit( fit - 1.96 * se.fit ),
+  upr   = faraway::ilogit( fit + 1.96 * se.fit ))
+#generate estimated prevalence for each year for plot
+mean_frame<-data %>% group_by(Year) %>% summarise(tmax=mean(tmax))
+mean_frame<-left_join(mean_frame,data %>% group_by(Year) %>% 
+                        summarise(spec_num=mean(spec_num)),by="Year")
+ndf<-data.frame(Year=as.factor(rep(c(2015,2016,2017),3)),
+                Species=as.factor(rep(c("WAWE","RBLE","RWBU"),each=3)),
+                precip=mean(data$precip),Age="a") 
+ndf<-left_join(ndf,mean_frame, by="Year")
+
+yhat <- predict(m, newdata=ndf, se.fit=TRUE,type = 'response')
+#generate standard error of predictions
+yhat <- data.frame( fit=yhat$fit, se.fit = yhat$se.fit)
+#bind predictions and error estimates to new data frame
+ndf <- cbind(ndf, yhat)
+ndf <- ndf %>% mutate(
+  lwr   = fit - 1.96 * se.fit,
+  upr   = fit + 1.96 * se.fit )
+#generate line for 2017 only significant year
+frame_2017<-new.df %>% filter(Year=="2017")
+#get prevalences for each temperature point
+points<-data %>% 
+  group_by(Year, Species, spec_num) %>% 
+  summarise(Samples=n(),Positive=sum(`result_0_1`==1),prev=Positive/Samples)
+#Finally plot
+ggplot(new.df, aes(x=spec_num)) + 
+  geom_point(data=points,aes(x=spec_num,y=prev,size=Samples), alpha=0.65)+
+  geom_line(data=frame_2017, aes(y=phat)) +
+  geom_abline(data = ndf,aes(intercept=fit,slope=0),linetype="dashed")+
+  geom_abline(data = ndf,aes(intercept=lwr,slope=0),linetype="dotted")+
+  geom_abline(data = ndf,aes(intercept=upr,slope=0),linetype="dotted")+
+  geom_ribbon(data=frame_2017, aes(ymin=lwr, ymax=upr), alpha=.3) +
+   facet_grid(Species~Year,scales = "free_y")+
+  coord_cartesian(xlim=c(7,11),ylim = c(0,0.5)) + 
+  ylab("Avian Malaria Prevalence") + 
+  xlab("Per Site Species Richness")+theme_bw() +
+  theme(axis.text.x = element_text(size = 9),
+        axis.text.y = element_text(size = 9),
+        axis.title.x = element_text(size = 10),
+        axis.title.y = element_text(size = 10)) + labs(size="Sample size")
+
+```
+
+#Plot Figure 4 of manuscipt showing lack of relationship between elevation and
+prevalence
+```{r}
+#get prevalence for each temperature point
+points<-malaria.data %>% mutate(Species=recode(Species,JAWE="WAWE")) %>% 
+  subset(Species %in% c("WAWE","RBLE","RWBU"))%>%
+  subset(Age %in% c("a","j"))%>%
+  group_by(Year, Species, elevation) %>% 
+  summarise(Samples=n(),Positive=sum(`result_0_1`==1),prev=Positive/Samples)
+CI<-binom::binom.confint(points$Positive,points$Samples, methods = "wilson")
+points<-cbind(points, CI[,5:6])
+#Finally plot
+ggplot(data=points, aes(x=elevation)) +
+  geom_point(data=points,aes(x=elevation,y=prev)) + 
+  geom_errorbar(data=points,aes(ymin=lower, ymax=upper), width=.2) + 
+  facet_grid(Species~Year, scales = "free_y") + 
+  ylab("Avian Malaria Prevalence") + 
+  xlab("Elevation (m)")+theme_bw()
+```
+
+#Estimate yearly prevalence weighted by species relative abundance
+```{r}
+#generate estimated prevalence by year
+mod<-glm(result_0_1~Species*tmax+Year*tmax+precip+Age+Year*spec_num, 
+         data = subsetted, family = binomial)
+#Building prediction data frame. Holding tmax and species richness constant 
+#at per year mean
+mean_frame<-subsetted %>% group_by(Year) %>% summarise(tmax=mean(tmax))
+mean_frame<-left_join(mean_frame,subsetted %>% group_by(Year) %>% 
+                        summarise(spec_num=mean(spec_num)),by="Year")
+ndf<-data.frame(Year=as.factor(rep(c(2015,2016,2017),3)),
+                Species=as.factor(rep(c("WAWE","RBLE","RWBU"),each=3)),
+                precip=mean(subsetted$precip),Age="a")
+ndf<-left_join(ndf,mean_frame, by="Year")%>% 
+  mutate(pred=predict(mod,newdata=., type = 'response')) %>% 
+  select(Year, Species, pred)
+weights<-left_join(subsetted %>% group_by(Year,Species) %>% 
+                    summarise(samp_per_year=n()),subsetted %>% 
+                    group_by(Year) %>% 
+                    summarise(total_year_samp=n()), by="Year") %>% 
+  mutate(relative_abun=samp_per_year/total_year_samp) %>% 
+  select(-samp_per_year,-total_year_samp)
+weighted_estimates<-left_join(ndf,weights,by=c("Year","Species")) %>%
+  mutate(value=pred*relative_abun) %>% group_by(Year) %>% 
+  summarise(weighted_coef=sum(value))
+weighted_estimates
+```
+#Bootstrapping to generate CI for yearly prevalence weighted by species 
+relative abundance
+```{r}
+#Generate bootstraps without running code in parallel 
+#(intervals presented in paper)
+options(dplyr.summarise.inform = FALSE)
+set.seed(1)
+sample_size=nrow(subsetted)
+trials<-1000
+Coef.Table<- matrix(nrow = trials,ncol = 3)
+for(j in 1:trials){
+print(j)
+
+index <- sample(1:sample_size, sample_size, replace=TRUE)
+Boot.temp <- subsetted %>% slice(index)
+mod<-glm(result_0_1~Species*tmax+Year*tmax+precip+Age+Year*spec_num, 
+         data = Boot.temp, family = binomial)
+mean_frame<-Boot.temp %>% group_by(Year) %>% summarise(tmax=mean(tmax))
+mean_frame<-left_join(mean_frame,Boot.temp %>% group_by(Year) %>% 
+                        summarise(spec_num=mean(spec_num)),by="Year")
+ndf<-data.frame(Year=as.factor(rep(c(2015,2016,2017),3)),
+              Species=as.factor(rep(c("WAWE","RBLE","RWBU"),each=3)),
+              precip=mean(Boot.temp$precip),Age="a")
+ndf<-left_join(ndf,mean_frame, by="Year")%>% 
+  mutate(pred=predict(mod,newdata=., type='response')) %>% 
+  select(Year, Species, pred)
+weights<-left_join(Boot.temp %>% group_by(Year,Species) %>% 
+                    summarise(samp_per_year=n()),Boot.temp %>% 
+                    group_by(Year) %>% 
+                    summarise(total_year_samp=n()), by="Year") %>% 
+  mutate(relative_abun=samp_per_year/total_year_samp) %>% 
+  select(-samp_per_year,-total_year_samp)
+weighted_estimates<-left_join(ndf,weights,by=c("Year","Species")) %>% 
+  mutate(value=pred*relative_abun) %>% group_by(Year) %>% 
+  summarise(weighted_coef=sum(value)) %>% pull(weighted_coef)
+
+Coef.Table[j,] <- weighted_estimates
+}
+
+```
+
+#Summarize bootstrap resutls
+```{r}
+dframe <- data.frame(Coef.Table)
+col_names<-c("2015","2016","2017")
+colnames(dframe)<-col_names
+sum.table<-dframe %>% 
+  pivot_longer(everything(),names_to = "Predictor", values_to="estimate") %>% 
+  group_by(`Predictor`) %>% 
+  summarise(Mean=mean(`estimate`))
+
+BCA_intervals<-matrix(ncol = 2, nrow = ncol(dframe))
+for (i in 1:ncol(dframe)) {
+ BCA_intervals[i,]<-coxed::bca(dframe[,i])
+}
+colnames(BCA_intervals)<-c("lwr","upr")
+temp<-data.frame(Predictor=col_names, BCA_intervals)
+sum.table<-left_join(sum.table, temp, by="Predictor")
+sum.table<-sum.table%>%rename(Year=Predictor)
+sum.table
+```
+
+```{r}
+#Coefficients generated by running in parallel 
+#(these coefs are slightly different than those presented in paper due 
+#random number generation)
+
+sample_size=nrow(subsetted)
+#set the number of rounds of replication
+trials<-1000
+#tell R how many cores are available
+registerDoParallel(2)
+#run using a "foreach" loop allows for parallel runs
+#each round will be sent to the object "predictor_bootstrap_values"
+#"system.time" will tell us how long this ran for
+system.time(predictor_bootstrap_coefficients<-
+              foreach (j=1:trials,.combine = rbind) %dopar% {
+#setting the seed for each round allows for reproducible results when
+#running in parallel
+  set.seed(j)
+index <- sample(1:sample_size, sample_size, replace=TRUE)
+Boot.temp <- subsetted %>% slice(index)
+mod<-glm(result_0_1~Species*tmax+Year*tmax+precip+Age+Year*spec_num, 
+         data = Boot.temp,family = binomial)
+mean_frame<-Boot.temp %>% group_by(Year) %>% summarise(tmax=mean(tmax))
+mean_frame<-left_join(mean_frame,Boot.temp %>% group_by(Year) %>% 
+                        summarise(spec_num=mean(spec_num)),by="Year")
+ndf<-data.frame(Year=as.factor(rep(c(2015,2016,2017),3)),
+              Species=as.factor(rep(c("WAWE","RBLE","RWBU"),each=3)),
+              precip=mean(Boot.temp$precip),Age="a")
+ndf<-left_join(ndf,mean_frame, by="Year")%>% 
+  mutate(pred=predict(mod,newdata=., type='response')) %>% 
+  select(Year, Species, pred)
+weights<-left_join(Boot.temp %>% group_by(Year,Species) %>% 
+                    summarise(samp_per_year=n()),Boot.temp %>% 
+                    group_by(Year) %>% 
+                    summarise(total_year_samp=n()), by="Year") %>% 
+  mutate(relative_abun=samp_per_year/total_year_samp) %>% 
+  select(-samp_per_year,-total_year_samp)
+weighted_estimates<-left_join(ndf,weights,by=c("Year","Species")) %>% 
+  mutate(value=pred*relative_abun) %>% group_by(Year) %>% 
+  summarise(weighted_coef=sum(value)) %>% pull(weighted_coef)
+#extract coefficients for each run and they will be stored in the object
+#"predictor_bootstrap_values" set above
+weighted_estimates
+})
+
+```
+
+```{r}
+names_coef<-c("2015","2016","2017")
+#converting the output from the bootstrap object to a data frame and
+#renaming the column headers
+predictor_bootstrap_coefficients.df<-
+  data.frame(predictor_bootstrap_coefficients)
+colnames(predictor_bootstrap_coefficients.df)<-names_coef
+
+rownames(predictor_bootstrap_coefficients.df) <- c()
+sum.table<-predictor_bootstrap_coefficients.df %>% 
+  pivot_longer(everything(),names_to = "Predictor", values_to="estimate") %>% 
+  group_by(`Predictor`) %>% 
+  summarise(Mean=mean(`estimate`))
+
+BCA_intervals<-matrix(ncol = 2, nrow = ncol(predictor_bootstrap_coefficients.df))
+for (i in 1:ncol(predictor_bootstrap_coefficients.df)) {
+ BCA_intervals[i,]<-coxed::bca(predictor_bootstrap_coefficients.df[,i])
+}
+colnames(BCA_intervals)<-c("lwr","upr")
+temp<-data.frame(Predictor=col_names, BCA_intervals)
+sum.table<-left_join(sum.table, temp, by="Predictor")
+sum.table<-sum.table%>%rename(Year=Predictor)
+sum.table
+```
+
+#Supplemental Figure 1
+```{r}
+#supplement precip figure
+subsetted %>% select(Year, Site, Month, precip) %>% unique(.) %>% ggplot(aes(x=Year, y=precip)) + geom_boxplot() + geom_jitter() + ylab('Precipitation (mm)')+theme_bw()
+
+```
+#Supplemental Figure 2
+```{r}
+#supplemental temp figure
+subsetted %>% select(Year, Site, Month, tmax) %>% unique(.) %>% ggplot(aes(x=Year, y=tmax)) + geom_boxplot() + geom_jitter() + ylab("Monthly Mean Maximum Temperature (°C)") +theme_bw()
+```
+
+
+#Supplemental Figure 6
+```{r}
+ratios<-malaria.data %>% subset(Age %in% c("a","j"))
+r<-ratios %>% group_by(Year,Month, Age) %>% summarise(sam=n()) %>% pivot_wider(names_from = Age, 
+              values_from = sam, values_fill = c(Samples=0))
+r$Total<-apply(r[,3:4],1,sum)
+#fraction juv figure supplement
+r %>% mutate(hy_ahy_ratio=j/a, frac_juv=j/Total) %>% ggplot(aes(x=Year, y=frac_juv)) +geom_boxplot()+geom_jitter() + ylab("Fraction of Juvenile Samples") + coord_cartesian(ylim = c(0,0.75)) + theme_bw()
+```
+#Below are other ways of generating model coefficients and determining the top
+model using k-fold cross-validation
+```{r}
+#Cross-validator identifying top model using AIC and BIC step-wise model
+#selection
+set.seed(1)
+trials=10
+k=10
+AIC_elev <- matrix(ncol=k, nrow = trials)
+AIC_tmax <- matrix(ncol=k, nrow = trials)
+AIC_tmin <- matrix(ncol=k, nrow = trials)
+BIC_elev <- matrix(ncol=k, nrow = trials)
+BIC_tmax <- matrix(ncol=k, nrow = trials)
+BIC_tmin <- matrix(ncol=k, nrow = trials)
+Ridge_model <- matrix(ncol=k, nrow=trials)
+for(j in 1:trials){
+print(j)
+fold<-createFolds(subsetted$result_0_1, k =k)
+for(i in 1:length(fold)){
+Train <- subsetted %>% slice(-fold[[i]])
+Test <- subsetted %>% slice(fold[[i]])
+Model.Matrix.Test<-model.matrix(
+  lm(result_0_1~precip*tmax+precip*Year+tmax*Species+
+                        Year*Age+Year*Species+Age*tmax+Species*Age+
+                        precip*Species+precip*Age+tmax*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m, data=Test))
+Model.Matrix.Train<-model.matrix(
+  lm(result_0_1~precip*tmax+precip*Year+tmax*Species+
+                        Year*Age+Year*Species+Age*tmax+Species*Age+
+                        precip*Species+precip*Age+tmax*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m, data=Train))
+
+#Ridge model. Make predictions based on new data and calculate AUC ROC
+ridge.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$result_0_1,family="binomial",
+            type.measure = "auc",alpha=0)
+ridge.preds <- 
+  predict(ridge.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=ridge.preds,
+                     known.class=Test$result_0_1)
+ridge_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Ridge_model[j,i]<-pROC::auc(ridge_proc)
+
+#AIC_elev
+elev<-stats::step(glm(result_0_1~precip*elevation+precip*Year+elevation*Species+
+                        Year*Age+Year*Species+Age*elevation+Species*Age+
+                        precip*Species+precip*Age+elevation*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,data = Train,
+               family=binomial), k = 2, trace=FALSE,direction="both")
+preds.elev<-predict(elev,Test,type='response')
+roc.data<-data.frame(Predictions=preds.elev,
+                     known.class=Test$result_0_1)
+roc.calc.elev<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+AIC_elev[j,i]<-pROC::auc(roc.calc.elev)
+
+#AIC_tmax
+tmax<-stats::step(glm(result_0_1~precip*tmax+precip*Year+tmax*Species+
+                        Year*Age+Year*Species+Age*tmax+Species*Age+
+                        precip*Species+precip*Age+tmax*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,
+                      data=Train,family = binomial), 
+                  k = 2,trace=FALSE,direction="both")
+preds.tmax<-predict(tmax,Test,type='response')
+roc.data<-data.frame(Predictions=preds.tmax,
+                     known.class=Test$result_0_1)
+roc.calc.tmax<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+AIC_tmax[j,i]<-pROC::auc(roc.calc.tmax)
+
+#AIC_tmin
+tmin<-stats::step(glm(result_0_1~precip*tmin+precip*Year+tmin*Species+
+                        Year*Age+Year*Species+Age*tmin+Species*Age+
+                        precip*Species+precip*Age+tmin*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,data=Train,
+            family = binomial), k = 2, trace=FALSE,direction="both")
+preds.tmin<-predict(tmin,Test,type='response')
+roc.data<-data.frame(Predictions=preds.tmin,
+                     known.class=Test$result_0_1)
+roc.calc.tmin<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+AIC_tmin[j,i]<-pROC::auc(roc.calc.tmin)
+
+#BIC_elev
+elev<-stats::step(glm(result_0_1~precip*elevation+precip*Year+elevation*Species+
+                        Year*Age+Year*Species+Age*elevation+Species*Age+
+                        precip*Species+precip*Age+elevation*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,data = Train,family=binomial),
+                  k = log(dim(Boot.temp)[1]), trace=FALSE,direction="both")
+preds.elev<-predict(elev,Test,type='response')
+roc.data<-data.frame(Predictions=preds.elev,
+                     known.class=Test$result_0_1)
+roc.calc.elev<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+BIC_elev[j,i]<-pROC::auc(roc.calc.elev)
+
+#BIC_tmax
+tmax<-stats::step(glm(result_0_1~precip*tmax+precip*Year+tmax*Species+
+                        Year*Age+Year*Species+Age*tmax+Species*Age+
+                        precip*Species+precip*Age+tmax*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,data=Train,
+            family = binomial),
+            k = log(dim(Boot.temp)[1]), trace=FALSE,direction="both")
+preds.tmax<-predict(tmax,Test,type='response')
+roc.data<-data.frame(Predictions=preds.tmax,
+                     known.class=Test$result_0_1)
+roc.calc.tmax<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+BIC_tmax[j,i]<-pROC::auc(roc.calc.tmax)
+
+#BIC_tmin
+tmin<-stats::step(glm(result_0_1~precip*tmin+precip*Year+tmin*Species+
+                        Year*Age+Year*Species+Age*tmin+Species*Age+
+                        precip*Species+precip*Age+tmin*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,data=Train,
+            family = binomial),
+            k = log(dim(Boot.temp)[1]), trace=FALSE,direction="both")
+preds.tmin<-predict(tmin,Test,type='response')
+roc.data<-data.frame(Predictions=preds.tmin,
+                     known.class=Test$result_0_1)
+roc.calc.tmin<-pROC::roc(roc.data$known.class, 
+                         roc.data$Predictions, quiet=TRUE)
+BIC_tmin[j,i]<-pROC::auc(roc.calc.tmin)
+
+}
+}
+#build data frame from CV output for statistical tests, summaries and plotting
+cv.summary.df<-rbind(data.frame(
+  auc=as.vector(AIC_elev), 
+                      Model=rep("AIC Elev", 
+                                 length=length(as.vector(AIC_elev)))),
+  data.frame(auc=as.vector(AIC_tmax), 
+                      Model=rep("AIC tmax", 
+                                 length=length(as.vector(AIC_tmax)))),
+  data.frame(auc=as.vector(AIC_tmin), 
+                      Model=rep("AIC tmin", 
+                                 length=length(as.vector(AIC_tmin)))),
+  data.frame(auc=as.vector(BIC_elev), 
+                      Model=rep("BIC elev", 
+                                 length=length(as.vector(BIC_elev)))),
+  data.frame(auc=as.vector(BIC_tmax), 
+                      Model=rep("BIC tmax", 
+                                 length=length(as.vector(BIC_tmax)))),
+  data.frame(auc=as.vector(BIC_tmin), 
+                      Model=rep("BIC tmin", 
+                                 length=length(as.vector(BIC_tmin)))),
+  data.frame(auc=as.vector(Ridge_model), 
+                      Model=rep("Ridge", 
+                                 length=length(as.vector(Ridge_model)))))
+```
+
+#Evaluate cross-validation results
+```{r}
+#run pairwise wilcox to test for difference in distribution of AUC values
+pairwise.wilcox.test(cv.summary.df$auc,cv.summary.df$Model,paired = TRUE)
+#generate AUC summary table
+knitr::kable(cv.summary.df %>% group_by(Model) %>% 
+               summarise(Mean.test.set.auc=mean(auc)%>% 
+                           round(4), Sd=sd(auc)%>%round(4)))
+cv.summary.df %>% ggplot(aes(x=Model,y=auc)) + geom_boxplot()
+```
+
+#Based on cross-validation step AIC with tmax performed best. Using step and
+1,000 rounds of bootstrap replication identify which predictors are retained in
+a certain percentage of replicates. 1,000 times a bootstrap replicate is
+generated and used as input into step. Once step completes we identify which
+predictors are retained, and store into a data frame. After 1,000 rounds 
+calculate the percentage of replicates that each term is kept in. The greater
+the percentage the more important the term in predicting infection.
+```{r}
+set.seed(1)
+Coef.Table<-NULL
+trials = 1000
+sample_size=nrow(subsetted)
+for(j in 1:trials){
+  print(j)
+  index <- sample(1:sample_size, sample_size, replace=TRUE)
+  Boot.temp <- subsetted %>% slice(index)
+  step.test <- stats::step(glm(result_0_1~precip*tmax+precip*Year+tmax*Species+
+                        Year*Age+Year*Species+Age*tmax+Species*Age+
+                        precip*Species+precip*Age+tmax*Year+Year*spec_num+
+                     NDVI_m+prop_impacted_500m,
+                      data=Boot.temp,family = binomial), 
+                  k = 2,trace=FALSE,direction="both")
+  ifelse(is.null(Coef.Table),
+Coef.Table <- t(as.data.frame(step.test$coefficients)),
+Coef.Table <- merge(Coef.Table, 
+                    t(as.data.frame(step.test$coefficients)), all=TRUE))
+}
+Perc.Incl_aic<-(trials - apply(apply(Coef.Table, 2, is.na),2,sum))/trials
+Perc.Incl_aic<-data.frame(as.list(Perc.Incl_aic))
+table_aic<-Perc.Incl_aic%>%
+  gather(key = Variable,
+         value = "Fraction of Bootstraps Term Included") %>% arrange(desc(`Fraction of Bootstraps Term Included`))
+table_aic
+```
+
+#Calculate boostrap coefficients for top model presented in the paper.
+```{r}
+trials = 1000
+sample_size=nrow(subsetted)
+registerDoParallel(2)
+system.time(predictor_bootstrap_coefficients<-
+              foreach (j=1:trials,.combine = 'rbind') %dopar% {
+  print(j)              
+  set.seed(j)
+index <- sample(1:sample_size, sample_size, replace=TRUE)
+  Boot.temp <- subsetted %>% slice(index)
+  step.test <- glm(result_0_1~tmax*Species+tmax*Year+Year*spec_num+precip+Age, 
+                        data=Boot.temp,family =binomial)
+
+step.test$coefficients
+})
+
+predictor_bootstrap_coefficients <- data.frame(predictor_bootstrap_coefficients)
+#generate mean estimate for each coefficient
+Mean.estimate<-predictor_bootstrap_coefficients %>% 
+  pivot_longer(everything(),names_to = "Predictor", 
+               values_to="estimate") %>% group_by(`Predictor`) %>% 
+  summarise(Mean=mean(`estimate`))
+#generate Bias Corrected and Adjusted 95% CI for each coefficient
+BCA_intervals<-
+  matrix(ncol = 2, nrow = ncol(predictor_bootstrap_coefficients))
+for (i in 1:ncol(predictor_bootstrap_coefficients)) {
+ BCA_intervals[i,]<-coxed::bca(predictor_bootstrap_coefficients[,i])
+}
+colnames(BCA_intervals)<-c("lwr","upr")
+BCA_interval_frame<-
+  data.frame(Predictor=
+               colnames(predictor_bootstrap_coefficients), 
+             BCA_intervals)
+logit_scale_coefficient_summary<-
+  left_join(Mean.estimate, BCA_interval_frame, 
+                     by="Predictor") %>%
+  mutate("contains.zero?"=
+           ifelse(
+             `lwr`<=0 & `upr`>=0,
+             "Y","N"))
+predictor_bootstrap_coefficients %>% 
+  pivot_longer(everything(),names_to = "Predictor", values_to="Mean") %>%
+  ggplot()+geom_histogram(aes(x=Mean), bins = 25) +
+  facet_wrap(~Predictor,scales = "free_x") + 
+  geom_vline(data =logit_scale_coefficient_summary,aes(xintercept=Mean)) + 
+  geom_vline(data = logit_scale_coefficient_summary,aes(xintercept=lwr),
+             linetype = "dashed",color="red")+ 
+  geom_vline(data = logit_scale_coefficient_summary,aes(xintercept=upr),
+             linetype = "dashed",color="red") + xlab("Estimate")
+logit_scale_coefficient_summary %>% mutate(dif=upr-lwr)
+```
+
+
